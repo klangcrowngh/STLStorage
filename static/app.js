@@ -1,4 +1,4 @@
-import { Viewer, parseSTL, geometryInfo, thumbnailFromBuffer, thumbnailFromGeometry } from './viewer.js';
+import { Viewer, loadModel, isCadFormat, thumbnailFromBuffer, thumbnailFromModel } from './viewer.js';
 
 const $app = document.getElementById('app');
 const $userSlot = document.getElementById('user-slot');
@@ -6,6 +6,7 @@ const $userSlot = document.getElementById('user-slot');
 const state = {
   me: null,
   allowRegistration: true,
+  formats: ['stl'],
   projects: [],
   home: { q: '', tags: new Set(), author: '', sort: 'recent' },
   project: null,
@@ -62,6 +63,11 @@ function h(tag, props, ...children) {
 /** replaceChildren, пропускающий null/false и вложенные массивы. */
 function fill(el, ...children) {
   el.replaceChildren(...children.flat(Infinity).filter((c) => c != null && c !== false));
+}
+
+function fileExt(name) {
+  const i = name.lastIndexOf('.');
+  return i > 0 ? name.slice(i + 1).toLowerCase() : '';
 }
 
 function plural(n, forms) {
@@ -373,6 +379,7 @@ async function boot() {
     const r = await api('GET', '/api/auth/me');
     state.me = r.user;
     state.allowRegistration = r.allow_registration;
+    state.formats = r.formats || state.formats;
   } catch (e) {
     fill($app, emptyState('cube', 'Сервер недоступен', e.message));
     return;
@@ -673,7 +680,7 @@ async function showProject(pid) {
   state.project = p;
   document.title = `${p.name} — STL Хранилище`;
   const s = state.proj;
-  fileInput = h('input', { type: 'file', accept: '.stl', multiple: true, hidden: true, onchange: (e) => { uploadFiles(e.target.files); e.target.value = ''; } });
+  fileInput = h('input', { type: 'file', accept: state.formats.map((f) => `.${f}`).join(','), multiple: true, hidden: true, onchange: (e) => { uploadFiles(e.target.files); e.target.value = ''; } });
   fill($app, h('div', { class: 'page project-page' },
     h('a', { class: 'back-link', href: '#/' }, icon('back'), 'Все проекты'),
     h('div', { class: 'page-head', id: 'proj-head' }),
@@ -719,7 +726,7 @@ function renderProjectList() {
     ? authorSelect(authors, s.author, (v) => { s.author = v; renderProjectList(); }) : '');
 
   const list = sortItems(p.models.filter((m) =>
-    matchQuery(s.q, m.name, m.file_name, m.tags, m.description)
+    matchQuery(s.q, m.name, m.file_name, m.format, m.tags, m.description)
     && [...s.tags].every((t) => m.tags.includes(t))
     && (!s.author || String(m.uploaded_by?.id) === s.author)), s.sort);
   const pending = uploads.filter((u) => u.pid === p.id).map((u) => u.el);
@@ -729,7 +736,7 @@ function renderProjectList() {
   fill(results,
     filtered && !list.length && noResults(() => { s.q = ''; s.tags.clear(); s.author = ''; showProject(p.id); }),
     h('div', { class: 'grid' },
-      addTile('Загрузить STL', 'или перетащите файлы в окно', () => fileInput.click()),
+      addTile('Загрузить модели', 'STL, 3MF, OBJ, STEP и другие — или перетащите файлы в окно', () => fileInput.click()),
       pending,
       list.map((m) => modelCard(m, toggle))));
 }
@@ -740,7 +747,9 @@ function modelCard(m, toggleTag) {
     class: 'card', tabIndex: 0, role: 'button',
     onclick: open, onkeydown: (e) => { if (e.key === 'Enter' && e.target === e.currentTarget) open(); },
   },
-  h('div', { class: 'cover' }, m.thumb ? h('img', { src: m.thumb, alt: '', loading: 'lazy' }) : h('div', { class: 'cover-empty' }, icon('cube'))),
+  h('div', { class: 'cover' },
+    m.thumb ? h('img', { src: m.thumb, alt: '', loading: 'lazy' }) : h('div', { class: 'cover-empty' }, icon('cube')),
+    h('span', { class: 'format-badge' }, m.format)),
   h('div', { class: 'card-body' },
     h('div', { class: 'card-title', title: m.name }, m.name),
     h('div', { class: 'card-meta' },
@@ -749,7 +758,7 @@ function modelCard(m, toggleTag) {
       m.comment_count ? [h('span', { class: 'dot' }, '·'), icon('chat'), m.comment_count] : null),
     cardTags(m.tags, state.proj.tags, toggleTag)),
   h('div', { class: 'card-actions' },
-    h('button', { class: 'icon-btn', type: 'button', title: 'Скачать STL', onclick: (e) => { e.stopPropagation(); downloadUrl(`/api/models/${m.id}/file`); } }, icon('download')),
+    h('button', { class: 'icon-btn', type: 'button', title: `Скачать ${m.format.toUpperCase()}`, onclick: (e) => { e.stopPropagation(); downloadUrl(`/api/models/${m.id}/file`); } }, icon('download')),
     canDelete(m.uploaded_by) && h('button', { class: 'icon-btn danger', type: 'button', title: 'Удалить модель', onclick: (e) => { e.stopPropagation(); deleteModel(m); } }, icon('trash'))));
 }
 
@@ -788,10 +797,12 @@ let uploading = false;
 function uploadFiles(fileList) {
   if (!state.project) return;
   const files = [...fileList];
-  const stl = files.filter((f) => /\.stl$/i.test(f.name));
-  if (stl.length < files.length) toast(`Пропущено файлов не в формате STL: ${files.length - stl.length}`, 'error');
-  for (const file of stl) {
-    const u = { pid: state.project.id, file, name: file.name.replace(/\.stl$/i, '') };
+  const supported = files.filter((f) => state.formats.includes(fileExt(f.name)));
+  if (supported.length < files.length) {
+    toast(`Пропущено файлов неподдерживаемого формата: ${files.length - supported.length}. Можно: ${state.formats.join(', ').toUpperCase()}`, 'error');
+  }
+  for (const file of supported) {
+    const u = { pid: state.project.id, file, ext: fileExt(file.name), name: file.name.replace(/\.[^.]+$/, '') };
     u.stage = h('span', {}, 'В очереди');
     u.bar = h('div');
     u.el = h('div', { class: 'card uploading' },
@@ -812,10 +823,10 @@ async function processQueue() {
   while (uploads.length) {
     const u = uploads[0];
     u.stage.textContent = 'Создание миниатюры…';
-    await new Promise((r) => requestAnimationFrame(() => setTimeout(r)));
+    await new Promise((r) => setTimeout(r, 0)); // дать интерфейсу отрисоваться (rAF во фоновой вкладке не срабатывает)
     let thumb = null;
     try {
-      thumb = await thumbnailFromBuffer(await u.file.arrayBuffer());
+      thumb = await thumbnailFromBuffer(await u.file.arrayBuffer(), u.ext);
     } catch (e) {
       console.warn('Миниатюра не создана:', u.file.name, e);
     }
@@ -843,7 +854,7 @@ async function processQueue() {
 
 // drag & drop файлов на страницу проекта
 const dropOverlay = h('div', { class: 'drop-overlay' },
-  h('div', { class: 'drop-box' }, icon('upload'), 'Отпустите, чтобы загрузить STL'));
+  h('div', { class: 'drop-box' }, icon('upload'), 'Отпустите, чтобы загрузить модели'));
 document.body.append(dropOverlay);
 let dragDepth = 0;
 const hasFiles = (e) => e.dataTransfer?.types?.includes('Files');
@@ -928,13 +939,13 @@ function openModelModal(mid) {
         onProgress: (p) => { loadingText.textContent = `Загрузка модели… ${Math.round(p * 100)}%`; },
       });
       if (ctx.closed) return;
-      loadingText.textContent = 'Обработка…';
+      loadingText.textContent = isCadFormat(ctx.model.format) ? 'Обработка CAD-модели… это может занять немного времени' : 'Обработка…';
       await new Promise((r) => setTimeout(r));
-      const geometry = parseSTL(buf);
-      if (ctx.closed) { geometry.dispose(); return; }
-      ctx.viewer.setGeometry(geometry);
+      const model = await loadModel(buf, ctx.model.format);
+      if (ctx.closed) return;
+      ctx.viewer.setModel(model);
       loading.remove();
-      const info = geometryInfo(geometry);
+      const { info } = model.userData;
       dims.hidden = false;
       dims.textContent = `${formatNum(info.x)} × ${formatNum(info.y)} × ${formatNum(info.z)} мм`;
       ctx.setGeometryInfo?.(info);
@@ -942,7 +953,7 @@ function openModelModal(mid) {
       toolbar.hidden = false;
       if (!ctx.model.thumb) {
         // старые/битые записи без миниатюры — создаём её из загруженной модели
-        const blob = await thumbnailFromGeometry(geometry);
+        const blob = await thumbnailFromModel(model);
         await saveThumb(ctx, blob, true);
       }
     } catch (e) {
@@ -1104,7 +1115,7 @@ function renderModelSide(ctx, side, modal) {
       h('button', { class: 'icon-btn', type: 'button', title: 'Закрыть (Esc)', onclick: () => modal.close() }, icon('x'))),
     h('div', { class: 'side-scroll' },
       h('div', { class: 'side-actions' },
-        h('a', { class: 'btn btn-primary', href: `/api/models/${m.id}/file`, download: '' }, icon('download'), 'Скачать STL'),
+        h('a', { class: 'btn btn-primary', href: `/api/models/${m.id}/file`, download: '' }, icon('download'), `Скачать ${m.format.toUpperCase()}`),
         canDelete(m.uploaded_by) && h('button', {
           class: 'btn btn-ghost danger', type: 'button',
           onclick: () => deleteModel(m, () => { ctx.dirty = false; modal.close(); }),

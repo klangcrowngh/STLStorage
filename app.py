@@ -2,7 +2,7 @@
 
 Данные лежат в STL_DATA_DIR (по умолчанию ./data):
   stl.db      — база SQLite (пользователи, проекты, модели, теги, комментарии)
-  files/      — загруженные STL-файлы
+  files/      — загруженные файлы моделей (STL, 3MF, OBJ, STEP и др.)
   thumbs/     — миниатюры моделей (PNG, рендерятся в браузере при загрузке)
   secret.key  — ключ подписи сессий (создаётся автоматически)
 
@@ -13,6 +13,7 @@
   python app.py users                          — список пользователей
 """
 import json
+import mimetypes
 import os
 import secrets
 import sqlite3
@@ -42,6 +43,10 @@ THREADS = int(os.environ.get("STL_THREADS", "16"))
 ALLOW_REGISTRATION = os.environ.get("STL_ALLOW_REGISTRATION", "1") not in ("0", "false", "no")
 
 MAX_THUMB_BYTES = 5 * 1024 * 1024
+# Форматы, которые умеет открывать просмотрщик в браузере
+MODEL_EXTENSIONS = ("stl", "3mf", "obj", "step", "stp", "iges", "igs", "ply", "glb", "gltf", "amf")
+
+mimetypes.add_type("application/wasm", ".wasm")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -220,6 +225,10 @@ def user_ref(user_id):
     return users_by_id().get(user_id) if user_id else None
 
 
+def file_format(file_name):
+    return file_name.rpartition(".")[2].lower()
+
+
 def thumb_url(row):
     return f"/api/models/{row['id']}/thumb?v={row['thumb_ver']}" if row["has_thumb"] else None
 
@@ -248,6 +257,7 @@ def model_dict(row, tags, comment_count=0):
         "name": row["name"],
         "description": row["description"],
         "file_name": row["file_name"],
+        "format": file_format(row["file_name"]),
         "size": row["size"],
         "thumb": thumb_url(row),
         "tags": tags,
@@ -322,7 +332,8 @@ def start_session(user_id):
 @app.get("/api/auth/me")
 def auth_me():
     user = current_user()
-    return jsonify(user=me_dict(user) if user else None, allow_registration=ALLOW_REGISTRATION)
+    return jsonify(user=me_dict(user) if user else None, allow_registration=ALLOW_REGISTRATION,
+                   formats=MODEL_EXTENSIONS)
 
 
 @app.post("/api/auth/login")
@@ -528,12 +539,14 @@ def upload_model(pid):
     if upload is None or not upload.filename:
         raise ApiError("Файл не передан")
     file_name = Path(upload.filename).name[:200]
-    if not file_name.lower().endswith(".stl"):
-        raise ApiError("Поддерживаются только файлы .stl")
-    name = clean_text(request.form.get("name"), 200) or file_name[:-4] or file_name
+    stem, dot, ext = file_name.rpartition(".")
+    ext = ext.lower()
+    if not dot or ext not in MODEL_EXTENSIONS:
+        raise ApiError("Неподдерживаемый формат. Можно: " + ", ".join(e.upper() for e in MODEL_EXTENSIONS))
+    name = clean_text(request.form.get("name"), 200) or stem or file_name
     tags = clean_tags(request.form.get("tags", "[]"))
 
-    stored_name = f"{uuid.uuid4().hex}.stl"
+    stored_name = f"{uuid.uuid4().hex}.{ext}"
     path = FILES_DIR / stored_name
     upload.save(path)
     size = path.stat().st_size
@@ -610,7 +623,7 @@ def download_model(mid):
     row = get_row("models", mid)
     inline = request.args.get("inline") == "1"
     return send_from_directory(
-        FILES_DIR, row["stored_name"], mimetype="model/stl",
+        FILES_DIR, row["stored_name"], mimetype="application/octet-stream",
         as_attachment=not inline, download_name=row["file_name"],
     )
 

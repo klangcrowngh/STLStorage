@@ -1,11 +1,21 @@
-// 3D-просмотрщик STL и генерация миниатюр (three.js)
+// 3D-просмотрщик моделей и генерация миниатюр (three.js)
 import * as THREE from 'three';
 import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+import { ThreeMFLoader } from 'three/addons/loaders/3MFLoader.js';
+import { PLYLoader } from 'three/addons/loaders/PLYLoader.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { AMFLoader } from 'three/addons/loaders/AMFLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 const MODEL_COLOR = 0xb9bec8;
 const THUMB_W = 640;
 const THUMB_H = 480;
+const OCCT_URL = '/static/vendor/occt/';
+
+// Форматы 3D-печати и CAD обычно Z-up, three.js — Y-up
+const Z_UP = new Set(['stl', '3mf', 'amf', 'step', 'stp', 'iges', 'igs']);
+const CAD = new Set(['step', 'stp', 'iges', 'igs']);
 
 const VIEWS = {
   iso: [1, 0.75, 1.2],
@@ -14,32 +24,138 @@ const VIEWS = {
   side: [1, 0, 0],
 };
 
-/** Разбирает STL (бинарный или ASCII) и ставит модель на «пол», по центру. */
-export function parseSTL(buffer) {
-  const geometry = new STLLoader().parse(buffer);
-  const pos = geometry.getAttribute('position');
-  if (!pos || pos.count === 0) throw new Error('Файл пустой или повреждён');
-  if (geometry.getAttribute('color')) geometry.deleteAttribute('color');
-  geometry.rotateX(-Math.PI / 2); // STL обычно Z-up, в three.js — Y-up
-  geometry.computeBoundingBox();
-  const bb = geometry.boundingBox;
-  const center = bb.getCenter(new THREE.Vector3());
-  geometry.translate(-center.x, -bb.min.y, -center.z);
-  geometry.computeVertexNormals();
-  geometry.computeBoundingBox();
-  geometry.computeBoundingSphere();
-  return geometry;
+export const isCadFormat = (ext) => CAD.has(ext);
+
+// ---------- загрузка ----------
+
+let occtPromise = null;
+
+/** CAD-движок (OpenCascade, wasm) подгружается только при первом открытии STEP/IGES. */
+function getOcct() {
+  if (!occtPromise) {
+    occtPromise = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = `${OCCT_URL}occt-import-js.js`;
+      script.onload = () => resolve(window.occtimportjs({ locateFile: (f) => OCCT_URL + f }));
+      script.onerror = () => reject(new Error('Не удалось загрузить CAD-модуль'));
+      document.head.append(script);
+    }).catch((e) => {
+      occtPromise = null;
+      throw e;
+    });
+  }
+  return occtPromise;
 }
 
-/** Габариты в исходных осях STL (мм) и количество треугольников. */
-export function geometryInfo(geometry) {
-  const size = geometry.boundingBox.getSize(new THREE.Vector3());
-  return { x: size.x, y: size.z, z: size.y, triangles: geometry.getAttribute('position').count / 3 };
+async function loadCad(buffer, ext) {
+  const occt = await getOcct();
+  const bytes = new Uint8Array(buffer);
+  const result = ext === 'step' || ext === 'stp' ? occt.ReadStepFile(bytes, null) : occt.ReadIgesFile(bytes, null);
+  if (!result?.success || !result.meshes?.length) throw new Error('Не удалось прочитать CAD-файл');
+  const group = new THREE.Group();
+  for (const m of result.meshes) {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(m.attributes.position.array, 3));
+    if (m.attributes.normal) g.setAttribute('normal', new THREE.Float32BufferAttribute(m.attributes.normal.array, 3));
+    if (m.index) g.setIndex(Array.from(m.index.array));
+    group.add(new THREE.Mesh(g));
+  }
+  return group;
 }
 
-function makeMaterial() {
-  return new THREE.MeshStandardMaterial({ color: MODEL_COLOR, roughness: 0.62, metalness: 0.02, side: THREE.DoubleSide });
+async function loadRaw(buffer, ext) {
+  switch (ext) {
+    case 'stl': return new THREE.Mesh(new STLLoader().parse(buffer));
+    case 'obj': return new OBJLoader().parse(new TextDecoder().decode(buffer));
+    case '3mf': return new ThreeMFLoader().parse(buffer);
+    case 'amf': return new AMFLoader().parse(buffer);
+    case 'ply': {
+      const g = new PLYLoader().parse(buffer);
+      return g.index ? new THREE.Mesh(g) : new THREE.Points(g); // без граней — облако точек
+    }
+    case 'glb':
+    case 'gltf':
+      return new Promise((resolve, reject) => new GLTFLoader().parse(buffer, '', (gltf) => resolve(gltf.scene),
+        (e) => reject(new Error(e?.message || 'Не удалось прочитать GLTF'))));
+    case 'step': case 'stp': case 'iges': case 'igs':
+      return loadCad(buffer, ext);
+    default:
+      throw new Error(`Формат .${ext} не поддерживается`);
+  }
 }
+
+function disposeTree(root) {
+  root.traverse((o) => {
+    o.geometry?.dispose();
+    for (const m of [o.material].flat()) {
+      if (!m) continue;
+      for (const v of Object.values(m)) if (v?.isTexture) v.dispose();
+      m.dispose();
+    }
+  });
+}
+
+/**
+ * Разбирает файл модели любого поддерживаемого формата.
+ * Результат — группа мешей с единым «глиняным» материалом, стоящая на полу по центру.
+ * В userData: box, sphere, material, info (габариты в осях исходного файла и число треугольников).
+ */
+export async function loadModel(buffer, ext) {
+  const raw = await loadRaw(buffer, ext);
+  raw.updateMatrixWorld(true);
+  const zUp = Z_UP.has(ext);
+  const toYUp = new THREE.Matrix4().makeRotationX(zUp ? -Math.PI / 2 : 0);
+  const material = new THREE.MeshStandardMaterial({ color: MODEL_COLOR, roughness: 0.62, metalness: 0.02, side: THREE.DoubleSide });
+  const group = new THREE.Group();
+  let triangles = 0;
+  let points = null;
+
+  raw.traverse((o) => {
+    if (!(o.isMesh || o.isPoints) || !o.geometry?.attributes.position?.count) return;
+    let g = o.geometry.clone();
+    for (const name of Object.keys(g.attributes)) if (name !== 'position' && name !== 'normal') g.deleteAttribute(name);
+    g.morphAttributes = {};
+    g.applyMatrix4(new THREE.Matrix4().multiplyMatrices(toYUp, o.matrixWorld));
+    if (o.isPoints) {
+      points ||= new THREE.PointsMaterial({ color: MODEL_COLOR, size: 1 });
+      group.add(new THREE.Points(g, points));
+      return;
+    }
+    if (!g.attributes.normal || ext === 'stl') {
+      // без нормалей — плоское затенение по граням: острые кромки остаются острыми
+      if (g.index) g = g.toNonIndexed();
+      g.computeVertexNormals();
+    }
+    triangles += (g.index ? g.index.count : g.attributes.position.count) / 3;
+    group.add(new THREE.Mesh(g, material));
+  });
+  disposeTree(raw);
+  if (!group.children.length) {
+    material.dispose();
+    throw new Error('В файле нет геометрии');
+  }
+
+  let box = new THREE.Box3().setFromObject(group);
+  const c = box.getCenter(new THREE.Vector3());
+  const offset = new THREE.Matrix4().makeTranslation(-c.x, -box.min.y, -c.z);
+  for (const child of group.children) child.geometry.applyMatrix4(offset);
+  box = new THREE.Box3().setFromObject(group);
+  const sphere = box.getBoundingSphere(new THREE.Sphere());
+  if (points) points.size = Math.max(sphere.radius / 250, 1e-4);
+
+  const size = box.getSize(new THREE.Vector3());
+  group.userData = {
+    box, sphere, material,
+    info: { x: size.x, y: zUp ? size.z : size.y, z: zUp ? size.y : size.z, triangles: Math.round(triangles) },
+  };
+  return group;
+}
+
+export function disposeModel(model) {
+  disposeTree(model);
+}
+
+// ---------- сцена и камера ----------
 
 function addLights(scene, camera) {
   scene.add(new THREE.HemisphereLight(0xffffff, 0x6d7a8c, 1.9));
@@ -50,8 +166,8 @@ function addLights(scene, camera) {
   scene.add(camera);
 }
 
-function fitCamera(camera, geometry, controls, view = 'iso', margin = 1.05) {
-  const { center, radius } = geometry.boundingSphere;
+function fitCamera(camera, model, controls, view = 'iso', margin = 1.05) {
+  const { center, radius } = model.userData.sphere;
   const r = radius || 1;
   const vFov = THREE.MathUtils.degToRad(camera.fov);
   const fov = camera.aspect < 1 ? 2 * Math.atan(Math.tan(vFov / 2) * camera.aspect) : vFov;
@@ -69,6 +185,8 @@ function fitCamera(camera, geometry, controls, view = 'iso', margin = 1.05) {
   }
 }
 
+// ---------- миниатюры ----------
+
 let thumbRenderer = null;
 function getThumbRenderer() {
   if (!thumbRenderer) {
@@ -80,31 +198,34 @@ function getThumbRenderer() {
   return thumbRenderer;
 }
 
-function renderToBlob(geometry, setupCamera) {
+function renderToBlob(model, setupCamera) {
   const renderer = getThumbRenderer();
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(35, THUMB_W / THUMB_H, 0.1, 1000);
-  const material = makeMaterial();
-  scene.add(new THREE.Mesh(geometry, material));
+  const copy = model.clone(); // геометрия и материал общие, модель остаётся в просмотрщике
+  copy.userData = model.userData;
+  const wire = model.userData.material.wireframe;
+  model.userData.material.wireframe = false;
+  scene.add(copy);
   addLights(scene, camera);
   setupCamera(camera);
   renderer.render(scene, camera);
-  material.dispose();
+  model.userData.material.wireframe = wire;
   return new Promise((resolve, reject) =>
     renderer.domElement.toBlob((b) => (b ? resolve(b) : reject(new Error('Не удалось создать миниатюру'))), 'image/png'));
 }
 
-export function thumbnailFromGeometry(geometry) {
-  return renderToBlob(geometry, (cam) => fitCamera(cam, geometry, null, 'iso', 0.95));
+export function thumbnailFromModel(model) {
+  return renderToBlob(model, (cam) => fitCamera(cam, model, null, 'iso', 0.95));
 }
 
-/** Миниатюра PNG для STL-файла (используется при загрузке). */
-export async function thumbnailFromBuffer(buffer) {
-  const geometry = parseSTL(buffer);
+/** Миниатюра PNG для файла модели (используется при загрузке). */
+export async function thumbnailFromBuffer(buffer, ext) {
+  const model = await loadModel(buffer, ext);
   try {
-    return await thumbnailFromGeometry(geometry);
+    return await thumbnailFromModel(model);
   } finally {
-    geometry.dispose();
+    disposeModel(model);
   }
 }
 
@@ -114,7 +235,9 @@ function niceStep(x) {
   return (n < 1.5 ? 1 : n < 3.5 ? 2 : n < 7.5 ? 5 : 10) * p;
 }
 
-/** Интерактивный просмотрщик: вращение, масштаб, сдвиг. */
+// ---------- интерактивный просмотрщик ----------
+
+/** Вращение, масштаб, сдвиг. */
 export class Viewer {
   constructor(container) {
     this.container = container;
@@ -155,14 +278,13 @@ export class Viewer {
     this.camera.updateProjectionMatrix();
   }
 
-  setGeometry(geometry) {
+  setModel(model) {
     this.clearModel();
-    this.geometry = geometry;
-    this.mesh = new THREE.Mesh(geometry, makeMaterial());
-    this.scene.add(this.mesh);
+    this.model = model;
+    this.scene.add(model);
 
-    const size = geometry.boundingBox.getSize(new THREE.Vector3());
-    const span = Math.max(size.x, size.z, 1) * 1.6;
+    const size = model.userData.box.getSize(new THREE.Vector3());
+    const span = Math.max(size.x, size.z, 1e-3) * 1.6;
     const step = niceStep(span / 10);
     const divisions = Math.max(2, Math.ceil(span / step));
     this.grid = new THREE.GridHelper(divisions * step, divisions, 0x8a93a3, 0x8a93a3);
@@ -173,11 +295,11 @@ export class Viewer {
   }
 
   setView(view) {
-    if (this.geometry) fitCamera(this.camera, this.geometry, this.controls, view);
+    if (this.model) fitCamera(this.camera, this.model, this.controls, view);
   }
 
   setWireframe(on) {
-    if (this.mesh) this.mesh.material.wireframe = on;
+    if (this.model) this.model.userData.material.wireframe = on;
   }
 
   setGrid(on) {
@@ -187,7 +309,7 @@ export class Viewer {
   /** Миниатюра с текущего ракурса камеры. */
   snapshot() {
     const src = this.camera;
-    return renderToBlob(this.geometry, (cam) => {
+    return renderToBlob(this.model, (cam) => {
       cam.fov = src.fov;
       cam.near = src.near;
       cam.far = src.far;
@@ -198,11 +320,10 @@ export class Viewer {
   }
 
   clearModel() {
-    if (this.mesh) {
-      this.scene.remove(this.mesh);
-      this.mesh.material.dispose();
-      this.mesh.geometry.dispose();
-      this.mesh = null;
+    if (this.model) {
+      this.scene.remove(this.model);
+      disposeModel(this.model);
+      this.model = null;
     }
     if (this.grid) {
       this.scene.remove(this.grid);

@@ -4,3 +4,4 @@
 *.bat text eol=crlf
 Dockerfile text eol=lf
 *.woff2 binary
+*.wasm binary
