@@ -1,0 +1,6 @@
+# Скрипты должны сохранять свои окончания строк на любой ОС
+* text=auto
+*.sh text eol=lf
+*.bat text eol=crlf
+Dockerfile text eol=lf
+*.woff2 binary

@@ -1,0 +1,12 @@
+services:
+  stl-storage:
+    build: .
+    container_name: stl-storage
+    restart: unless-stopped
+    ports:
+      - "8000:8000"          # слева — порт на сервере, можно поменять, например "80:8000"
+    environment:
+      - STL_MAX_UPLOAD_MB=1024        # максимальный размер одного файла, МБ
+      - STL_ALLOW_REGISTRATION=1      # 0 — запретить самостоятельную регистрацию
+    volumes:
+      - ./data:/data                  # все данные (база, STL, миниатюры) — здесь
